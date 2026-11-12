@@ -1,0 +1,24 @@
+# Set path to your converted SIMD root. Relative paths are resolved from this YAML.
+# Example layout: repository/datasets/SIMD/images/{train,val,test}/
+path: ../datasets/SIMD
+train: images/train
+val: images/val
+test: images/test
+nc: 15
+# Verify this zero-based mapping against your converted annotations.
+names:
+  0: Car
+  1: Truck
+  2: Van
+  3: Long_Vehicle
+  4: Bus
+  5: Airliner
+  6: Propeller_Aircraft
+  7: Trainer_Aircraft
+  8: Chartered_Aircraft
+  9: Fighter_Aircraft
+  10: Others
+  11: Stair_Truck
+  12: Pushback_Truck
+  13: Helicopter
+  14: Boat

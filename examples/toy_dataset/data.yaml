@@ -1,0 +1,6 @@
+path: .
+test: images/test
+nc: 2
+names:
+  0: compact_rectangle
+  1: large_rectangle
