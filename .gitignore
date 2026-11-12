@@ -1,0 +1,30 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+.env
+.env.*
+!.env.example
+
+# Generated outputs and local datasets.
+/outputs/
+/runs/
+/datasets/
+
+# Private experiment assets are not part of this release.
+*.pt
+*.pth
+*.onnx
+*.engine
+*.torchscript
+*.ckpt
+*.zip
+*.7z
+*.log
+/_private*/
+/backup*/

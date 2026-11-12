@@ -1,0 +1,28 @@
+cff-version: 1.2.0
+message: "Please cite the associated manuscript when using these project materials or supporting tools."
+title: "SDF-YOLO: Project Materials and Supporting Code"
+type: software
+version: 0.1.0
+license: AGPL-3.0
+authors:
+  - family-names: Li
+    given-names: Chunzhi
+  - family-names: Rong
+    given-names: Qianliang
+  - family-names: Chen
+    given-names: Xiaohua
+  - family-names: Zheng
+    given-names: Huimeng
+preferred-citation:
+  type: unpublished
+  title: "Dynamic Shape-Aware and Bi-Directional Reconstruction for Small Object Detection"
+  authors:
+    - family-names: Li
+      given-names: Chunzhi
+    - family-names: Rong
+      given-names: Qianliang
+    - family-names: Chen
+      given-names: Xiaohua
+    - family-names: Zheng
+      given-names: Huimeng
+  notes: "Manuscript; no publication venue or DOI is assigned in this release."
