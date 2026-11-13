@@ -79,7 +79,7 @@ python val.py
 The manuscript title and author list are recorded in [CITATION.cff](CITATION.cff). Publication details and a DOI are not assigned in this release.
 
 ```bibtex
-@unpublished{li_sdf_yolo,
+@unpublished{
   title  = {Dynamic Shape-Aware and Bi-Directional Reconstruction for Small Object Detection},
   author = {Li, Chunzhi and Rong, Qianliang and Chen, Xiaohua and Zheng, Huimeng},
   note   = {Manuscript}
