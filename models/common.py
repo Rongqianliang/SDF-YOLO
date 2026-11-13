@@ -62,7 +62,7 @@ __all__ = (
     'Converse2D1', 
     'ConverseBlock1', 
     'C3_Converse1', 
-    'FADR', 
+    'BGCR', 
     'ECAGate1', 
     'DWRefine1',
     'DSA',
@@ -166,7 +166,38 @@ class HGBlock(nn.Module):
         y.extend(m(y[-1]) for m in self.m)
         y = self.ec(self.sc(torch.cat(y, 1)))
         return y + x if self.add else y
+class LayerNorm(nn.Module):
+    """
+    LayerNorm that supports channels_last or channels_first.
+    """
+    def __init__(self, normalized_shape, eps=1e-6, data_format="channels_last"):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(normalized_shape))
+        self.bias = nn.Parameter(torch.zeros(normalized_shape))
+        self.eps = eps
+        self.data_format = data_format
 
+        if self.data_format not in ["channels_last", "channels_first"]:
+            raise NotImplementedError
+
+        self.normalized_shape = (normalized_shape,)
+
+    def forward(self, x):
+        if self.data_format == "channels_last":
+            return F.layer_norm(
+                x,
+                self.normalized_shape,
+                self.weight,
+                self.bias,
+                self.eps
+            )
+
+        if self.data_format == "channels_first":
+            u = x.mean(1, keepdim=True)
+            s = (x - u).pow(2).mean(1, keepdim=True)
+            x = (x - u) / torch.sqrt(s + self.eps)
+            x = self.weight[:, None, None] * x + self.bias[:, None, None]
+            return x
 
 class SPP(nn.Module):
     """Spatial Pyramid Pooling (SPP) layer https://arxiv.org/abs/1406.4729."""
@@ -1602,11 +1633,6 @@ class SimAM_Residual(nn.Module):
         return x * (1.0 + self.alpha * g)
 
 
-# =========================================================
-# 1) Remote Sensing Context branch (very light params)
-# =========================================================
-
-#####################################################消融########################################################
 class SWCF(nn.Module):
     MODES = {"local", "shape", "equal", "learnable"}
 
@@ -1685,53 +1711,6 @@ class C3k2_SWCF(C3k2):
             )
             for _ in range(n)
         )
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-from .conv import Conv
-from .converse_modules import Converse2D, ECAGate, DWRefine, ConverseBlock
-
-__all__ = ['Converse2D1', 'ConverseBlock1', 'C3_Converse1', 'FADR', 'ECAGate1', 'DWRefine1']
-
-
-class LayerNorm(nn.Module):
-    """
-    LayerNorm that supports channels_last or channels_first.
-    """
-    def __init__(self, normalized_shape, eps=1e-6, data_format="channels_last"):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(normalized_shape))
-        self.bias = nn.Parameter(torch.zeros(normalized_shape))
-        self.eps = eps
-        self.data_format = data_format
-
-        if self.data_format not in ["channels_last", "channels_first"]:
-            raise NotImplementedError
-
-        self.normalized_shape = (normalized_shape,)
-
-    def forward(self, x):
-        if self.data_format == "channels_last":
-            return F.layer_norm(
-                x,
-                self.normalized_shape,
-                self.weight,
-                self.bias,
-                self.eps
-            )
-
-        if self.data_format == "channels_first":
-            u = x.mean(1, keepdim=True)
-            s = (x - u).pow(2).mean(1, keepdim=True)
-            x = (x - u) / torch.sqrt(s + self.eps)
-            x = self.weight[:, None, None] * x + self.bias[:, None, None]
-            return x
-
 
 class ECAGate1(nn.Module):
     """
@@ -1985,7 +1964,8 @@ class Converse2D1(nn.Module):
         return z
 
 
-class FADR(nn.Module):
+
+class BGCR(nn.Module):
     def __init__(
         self,
         c1,
@@ -2000,7 +1980,7 @@ class FADR(nn.Module):
         super().__init__()
 
         if c2 is not None and c2 != c1:
-            raise ValueError("FADR keeps channels unchanged, requiring c2 == c1.")
+            raise ValueError("BGCR keeps channels unchanged, requiring c2 == c1.")
 
         self.use_dynamic_lambda = use_dynamic_lambda
         self.use_refine = use_refine
