@@ -1713,63 +1713,26 @@ class C3k2_SWCF(C3k2):
         )
 
 class ECAGate1(nn.Module):
-    """
-    Channel-wise adaptive regularization gate.
 
-    Input:
-        x: (N, C, H, W)
-
-    Output:
-        gate: (N, C, 1, 1), range [0, 1]
-    """
     def __init__(self, k=3):
         super().__init__()
+        if not isinstance(k, int) or k < 1 or k % 2 == 0:
+            raise ValueError("Gate kernel size must be a positive odd integer.")
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.conv = nn.Conv1d(
-            in_channels=1,
-            out_channels=1,
-            kernel_size=k,
-            padding=k // 2,
-            bias=False
-        )
+        self.conv = nn.Conv1d(1, 1, k, padding=k // 2, bias=False)
 
     def forward(self, x):
-        y = self.avg_pool(x)                    # (N, C, 1, 1)
-        y = y.squeeze(-1).permute(0, 2, 1)      # (N, 1, C)
-        y = self.conv(y)                        # (N, 1, C)
-        y = torch.sigmoid(y)
-        y = y.permute(0, 2, 1).unsqueeze(-1)    # (N, C, 1, 1)
-        return y
+        descriptor = self.avg_pool(x).squeeze(-1).transpose(1, 2)
+        gate = torch.sigmoid(self.conv(descriptor))
+        return gate.transpose(1, 2).unsqueeze(-1)
 
 
 class DWRefine1(nn.Module):
-    """
-    Local Detail Compensation.
 
-    Structure:
-        x -> DWConv 3x3 -> PWConv 1x1 -> SiLU -> residual add
-    """
     def __init__(self, c):
         super().__init__()
-        self.dw = nn.Conv2d(
-            c,
-            c,
-            kernel_size=3,
-            stride=1,
-            padding=1,
-            groups=c,
-            bias=False
-        )
-
-        self.pw = nn.Conv2d(
-            c,
-            c,
-            kernel_size=1,
-            stride=1,
-            padding=0,
-            bias=False
-        )
-
+        self.dw = nn.Conv2d(c, c, 3, padding=1, groups=c, bias=False)
+        self.pw = nn.Conv2d(c, c, 1, bias=False)
         self.act = nn.SiLU()
 
     def forward(self, x):
@@ -1777,251 +1740,133 @@ class DWRefine1(nn.Module):
 
 
 class Converse2D1(nn.Module):
-    """
-    Converse2D operator.
-
-    It performs depthwise frequency-domain inverse reconstruction based on
-    a regularized closed-form solution. This operator is inspired by the
-    reverse convolution formulation in ConverseNet. :contentReference[oaicite:0]{index=0}
-    """
-    def __init__(
-        self,
-        in_channels,
-        out_channels=None,
-        kernel_size=5,
-        scale=1,
-        padding_mode='reflect',
-        eps=1e-5,
-        act=False
-    ):
+    
+    def __init__(self, in_channels, out_channels=None, kernel_size=3, scale=2,
+                 padding_mode="reflect", alpha_init=1e-5, act=False):
         super().__init__()
-
         if out_channels is None:
             out_channels = in_channels
-
-        assert out_channels == in_channels, \
-            "Converse2D must be depthwise, requiring in_channels == out_channels."
-
+        if out_channels != in_channels:
+            raise ValueError("Reconstruction is depthwise and preserves channels.")
+        if not isinstance(kernel_size, int) or kernel_size < 1 or kernel_size % 2 == 0:
+            raise ValueError("Reconstruction kernel size must be a positive odd integer.")
+        if not isinstance(scale, int) or scale < 1:
+            raise ValueError("scale must be a positive integer.")
+        if padding_mode != "reflect":
+            raise ValueError("The paper implementation uses reflect padding.")
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.kernel_size = kernel_size
         self.scale = scale
         self.padding = kernel_size // 2
         self.padding_mode = padding_mode
-        self.eps = eps
 
-        self.weight = nn.Parameter(
-            torch.randn(1, self.in_channels, self.kernel_size, self.kernel_size)
-        )
+        initial_kernel = torch.randn(1, in_channels, kernel_size, kernel_size)
+        initial_kernel = initial_kernel.flatten(2).softmax(-1).view_as(initial_kernel)
+        self.weight = nn.Parameter(initial_kernel)
+        self.alpha = nn.Parameter(torch.tensor(float(alpha_init)))
+        self.act = nn.Identity() if act is False else (act() if isinstance(act, type) else act)
 
-        self.bias = nn.Parameter(
-            torch.zeros(1, self.in_channels, 1, 1)
-        )
+    def regularization(self, lambda_gate=None):
+        beta = torch.sigmoid(self.alpha)
+        return beta if lambda_gate is None else beta * lambda_gate
 
-        # Softmax initialization for stable kernel distribution.
-        with torch.no_grad():
-            self.weight.data = F.softmax(
-                self.weight.data.view(1, self.in_channels, -1),
-                dim=-1
-            ).view(1, self.in_channels, self.kernel_size, self.kernel_size)
+    @staticmethod
+    def splits(a, scale):
 
-        self.act = nn.Identity()
-        if act:
-            self.act = act() if isinstance(act, type) else act
+        leading = a.shape[:-2]
+        height, width = a.shape[-2:]
+        if height % scale or width % scale:
+            raise ValueError("Spectral dimensions must be divisible by scale.")
+        blocks = a.reshape(*leading, scale, height // scale, scale, width // scale)
+        n = len(leading)
+        order = list(range(n)) + [n + 1, n + 3, n, n + 2]
+        return blocks.permute(*order).reshape(*leading, height // scale, width // scale, scale ** 2)
+
+    @staticmethod
+    def p2o(psf, shape):
+        kh, kw = psf.shape[-2:]
+        if shape[0] < kh or shape[1] < kw:
+            raise ValueError("The target grid must be at least as large as the kernel.")
+        otf = F.pad(psf, (0, shape[1] - kw, 0, shape[0] - kh))
+        otf = torch.roll(otf, shifts=(-(kh // 2), -(kw // 2)), dims=(-2, -1))
+        return torch.fft.fftn(otf, dim=(-2, -1))
+
+    @staticmethod
+    def upsample_zeros(x, scale):
+        out = x.new_zeros(*x.shape[:-2], x.shape[-2] * scale, x.shape[-1] * scale)
+        out[..., ::scale, ::scale] = x
+        return out
+
+    def reconstruct(self, observation, beta):
+        if observation.dtype not in (torch.float32, torch.float64):
+            raise TypeError("BGCR reconstruction requires float32/float64; use amp=False.")
+        if beta.ndim != 0 and beta.shape != (*observation.shape[:2], 1, 1):
+            raise ValueError("beta must be a scalar or have shape (B, C, 1, 1).")
+        if not bool(torch.isfinite(beta).all()) or not bool((beta > 0).all()):
+            raise FloatingPointError("Eq. (4) requires finite beta > 0; check sigmoid saturation.")
+        scale = self.scale
+        inserted = self.upsample_zeros(observation, scale)
+        prior = F.interpolate(observation, scale_factor=scale, mode="nearest")
+        fk = self.p2o(self.weight, inserted.shape[-2:])
+        fk_conj = fk.conj()
+        energy = fk.abs().square()
+        g = fk_conj * torch.fft.fftn(inserted, dim=(-2, -1))
+        g = g + beta * torch.fft.fftn(prior, dim=(-2, -1))
+        if scale == 1:
+            spectrum = g / (energy + beta)
+        else:
+            numerator = self.splits(fk * g, scale).mean(dim=-1)
+            denominator = self.splits(energy, scale).mean(dim=-1) + beta
+            correction = (numerator / denominator).repeat(1, 1, scale, scale)
+            spectrum = (g - fk_conj * correction) / beta
+        return torch.fft.ifftn(spectrum, dim=(-2, -1)).real
 
     def forward(self, x, lambda_gate=None):
-        # 1. Padding
-        if self.padding > 0:
-            if self.padding_mode == 'constant':
-                x = F.pad(
-                    x,
-                    pad=[self.padding, self.padding, self.padding, self.padding],
-                    mode='constant',
-                    value=0.0
-                )
-            else:
-                x = F.pad(
-                    x,
-                    pad=[self.padding, self.padding, self.padding, self.padding],
-                    mode=self.padding_mode
-                )
-
-        # 2. Base regularization parameter
-        lambda_base = torch.sigmoid(self.bias - 9.0) + self.eps
-
-        # 3. Adaptive regularization modulation
-        if lambda_gate is not None:
-            lambda_base = lambda_base * (0.5 + lambda_gate)
-
-        _, _, h, w = x.shape
-
-        # 4. Construct zero-inserted observation and initial estimate
-        if self.scale > 1:
-            STy = self.upsample_zeros(x, scale=self.scale)
-            X0 = F.interpolate(x, scale_factor=self.scale, mode='nearest')
-        else:
-            STy = x
-            X0 = x
-
-        target_h, target_w = h * self.scale, w * self.scale
-
-        # 5. PSF to OTF
-        FB = self.p2o(self.weight, (target_h, target_w))
-        FBC = torch.conj(FB)
-        F2B = torch.pow(torch.abs(FB), 2)
-
-        # 6. Frequency-domain terms
-        FBFy = FBC * torch.fft.fftn(STy, dim=(-2, -1))
-        FR = FBFy + torch.fft.fftn(lambda_base * X0, dim=(-2, -1))
-
-        # 7. Closed-form solution
-        if self.scale > 1:
-            x1 = FB.mul(FR)
-
-            FBR = torch.mean(
-                self.splits(x1, self.scale),
-                dim=-1,
-                keepdim=False
-            )
-
-            invW = torch.mean(
-                self.splits(F2B, self.scale),
-                dim=-1,
-                keepdim=False
-            )
-
-            invWBR = FBR.div(invW + lambda_base)
-            FCBinvWBR = FBC * invWBR.repeat(1, 1, self.scale, self.scale)
-
-            FX = (FR - FCBinvWBR) / lambda_base
-        else:
-            FX = FR / (F2B + lambda_base)
-
-        # 8. Inverse FFT
-        out = torch.real(torch.fft.ifftn(FX, dim=(-2, -1)))
-
-        # 9. Remove padding
-        if self.padding > 0:
-            crop = self.padding * self.scale
+        if x.ndim != 4 or x.shape[1] != self.in_channels:
+            raise ValueError("Input must have shape (B, in_channels, H, W).")
+        pad = self.padding
+        if min(x.shape[-2:]) <= pad:
+            raise ValueError("Reflect padding requires H and W greater than the padding size.")
+        beta = self.regularization(lambda_gate)
+        extended = F.pad(x, (pad, pad, pad, pad), mode="reflect") if pad else x
+        out = self.reconstruct(extended, beta)
+        crop = pad * self.scale
+        if crop:
             out = out[..., crop:-crop, crop:-crop]
-
         return self.act(out)
-
-    def splits(self, a, scale):
-        *leading_dims, W, H = a.size()
-        W_s, H_s = W // scale, H // scale
-
-        b = a.view(*leading_dims, scale, W_s, scale, H_s)
-
-        permute_order = (
-            list(range(len(leading_dims))) +
-            [
-                len(leading_dims) + 1,
-                len(leading_dims) + 3,
-                len(leading_dims),
-                len(leading_dims) + 2
-            ]
-        )
-
-        b = b.permute(*permute_order).contiguous()
-        b = b.view(*leading_dims, W_s, H_s, scale * scale)
-
-        return b
-
-    def p2o(self, psf, shape):
-        """
-        Convert PSF kernel to OTF kernel.
-        """
-        otf = torch.zeros(psf.shape[:-2] + shape).type_as(psf)
-
-        otf[..., :psf.shape[-2], :psf.shape[-1]].copy_(psf)
-
-        otf = torch.roll(
-            otf,
-            shifts=(-int(psf.shape[-2] / 2), -int(psf.shape[-1] / 2)),
-            dims=(-2, -1)
-        )
-
-        otf = torch.fft.fftn(otf, dim=(-2, -1))
-
-        return otf
-
-    def upsample_zeros(self, x, scale):
-        """
-        Zero-insert upsampling.
-        """
-        z = torch.zeros(
-            x.shape[0],
-            x.shape[1],
-            x.shape[2] * scale,
-            x.shape[3] * scale,
-            device=x.device,
-            dtype=x.dtype
-        )
-
-        z[..., ::scale, ::scale].copy_(x)
-
-        return z
-
 
 
 class BGCR(nn.Module):
-    def __init__(
-        self,
-        c1,
-        c2=None,
-        k=3,
-        scale=2,
-        use_dynamic_lambda=True,
-        use_refine=True,
-        padding_mode="reflect",
-        eps=1e-5,
-    ):
+
+    def __init__(self, c1, c2=None, k=3, scale=2, use_dynamic_lambda=True,
+                 use_refine=True, padding_mode="reflect", alpha_init=1e-5):
         super().__init__()
-
         if c2 is not None and c2 != c1:
-            raise ValueError("BGCR keeps channels unchanged, requiring c2 == c1.")
-
+            raise ValueError("BGCR preserves channels; the parser must pass c2 == c1.")
         self.use_dynamic_lambda = use_dynamic_lambda
         self.use_refine = use_refine
-
-        # Use the temperature-free implementation defined in this file.
-        self.op = Converse2D1(
-            in_channels=c1,
-            out_channels=c1,
-            kernel_size=k,
-            scale=scale,
-            padding_mode=padding_mode,
-            eps=eps,
-        )
-
+        self.op = Converse2D1(c1, c1, k, scale, padding_mode, alpha_init)
         if use_dynamic_lambda:
             self.lambda_gate = ECAGate1(k=3)
-
         if use_refine:
             self.refine = DWRefine1(c1)
 
+    @property
+    def alpha(self):
+        return self.op.alpha
+
+    def regularization(self, x):
+        gate = self.lambda_gate(x) if self.use_dynamic_lambda else None
+        return self.op.regularization(gate)
+
     def forward(self, x):
-        lambda_gate = (
-            self.lambda_gate(x)
-            if self.use_dynamic_lambda
-            else None
-        )
+        gate = self.lambda_gate(x) if self.use_dynamic_lambda else None
+        out = self.op(x, lambda_gate=gate)
+        return self.refine(out) if self.use_refine else out
 
-        y = self.op(x, lambda_gate=lambda_gate)
-
-        if self.use_refine:
-            y = self.refine(y)
-
-        return y
 
 class ConverseBlock1(nn.Module):
-    """
-    ConverseBlock for YOLO integration.
-
-    Structure:
-        LayerNorm -> 1x1 Conv -> GELU -> Converse2D -> GELU -> 1x1 Conv -> Residual
-    """
     def __init__(self, c1, c2, k=5, s=1, e=0.5):
         super().__init__()
 
@@ -2074,9 +1919,6 @@ class ConverseBlock1(nn.Module):
 
 
 class C3_Converse1(nn.Module):
-    """
-    C3 variant that stacks ConverseBlock modules inside a CSP-style wrapper.
-    """
     def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5, k=5, s=1):
         super().__init__()
 
